@@ -1,0 +1,207 @@
+---
+title: "QC Notes, Transcriptomics Data, 1st Alignment, Final QC"
+output:
+  html_notebook:
+    toc: yes
+  BiocStyle::pdf_document:
+    includes: null
+    toc: no
+  html_document:
+    df_print: paged
+    toc: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE)
+options(digits=4)
+library(plyr)
+library(reshape2)
+library(data.table)
+library(ggplot2)
+apatheme = theme_bw()+
+           theme(panel.grid.major=element_blank(),
+                 panel.grid.minor=element_blank(),
+                 panel.border=element_blank(),
+                 axis.line=element_line())
+
+countSummaryData <- function(ff) {
+  dd = read.delim(ff, header=T, row.names=1)
+  colnames(dd) = gsub('.*mt[gx].([A-Z0-9]+\\.[A-Z0-9_]+).sort.bam', '\\1', colnames(dd))
+  dd = as.data.frame(t(dd))
+  dd$Total = rowSums(dd)
+  dd$Timep = rownames(dd)
+  dd$Unmapped_pc = dd$Unassigned_Unmapped / dd$Total
+  dd$Assigned_pc = dd$Assigned / dd$Total
+  dd$NoFeatures_pc = dd$Unassigned_NoFeatures / dd$Total
+  return(data.table(dd))
+}
+plotBars <- function(dd, cols=c('Assigned','Unassigned_NoFeatures','Unassigned_Unmapped'), xscale='Reads', 
+                     ytext=2, id.vars='Timep') {
+  bcol = c(id.vars,cols)
+  ddt = melt.data.table(dd[,..bcol], id.vars=id.vars, value.name='Value', variable.name='ReadType')
+  means = 0
+  bcol = rev(cols)
+  if(length(cols) > 1) means = colMeans(dd[,..bcol])
+  lins = cumsum(means)
+  gg = ggplot(data=ddt) + 
+       geom_bar(aes_string(x=id.vars, y="Value", fill="ReadType"),
+                stat='identity') + 
+       geom_hline(yintercept=lins) +
+       coord_flip() + ylab(xscale) +
+       apatheme + theme(axis.text.y=element_text(size=ytext))
+  return(gg)
+}
+```
+
+# Mapping indicators
+
+## Introduction
+
+This corresponds to the quality control analysis of metatranscriptomics data.  The alignment is performed against the personal genomic references used for the alignment of metagenomics data.
+Counting is performed at the CDS level.
+
+```{r include=FALSE}
+projDir <- '~/Projects/201808-FunMG-Kaiko/'
+qcDir <- paste0(projDir, 'data/20190522-QCData-rcg/')
+mtgDir = paste0(qcDir, 'mtx/')
+
+count_qcFiles = list.files(path=qcDir, pattern='count.*.summary', full.names=T)
+
+rmFile = paste0(projDir, 'data/20190723-RemovedTPs/remove-list.txt')
+rmSampTP = readLines(rmFile)
+rmSampTP = rmSampTP[-grep('^#',rmSampTP)]
+```
+
+### Basic mapping stats
+
+Data from the aligner (`bowtie2`) log files. These are ordered by total number of paired end reads per timepoint.
+```{r echo=FALSE}
+mapFiles = list.files(path=mtgDir, pattern='[CEHMP][0-9]+', full.names=T)
+fn = gsub('([CEHMP][0-9]+)-([A-Z0-9_]+)_align.log$','\\1\\.\\2',basename(mapFiles))
+procLogFile <- function(ff) {
+  ll = readLines(con=ff)
+  nr = strtoi(unlist(strsplit(ll[grep('reads; of these:$',ll)],'[ ]+'))[1])
+  su = strtoi(unlist(strsplit(ll[grep('aligned 0 times$',ll)],'[ ]+'))[2])
+  s1 = strtoi(unlist(strsplit(ll[grep('aligned exactly 1 time$',ll)],'[ ]+'))[2])
+  sm = strtoi(unlist(strsplit(ll[grep('aligned >1 times$',ll)],'[ ]+'))[2])
+  return(list(S.tot=nr, S.1=s1, S.mul=sm, S.0=su, map.se=(s1+sm)/(nr)))
+}
+# The mapFiles and fn lists are in sync, remove from both.  The matching uses the fact that timepoint IDs uniquely identify samples
+nn = unlist(sapply(rmSampTP, function(z) grep(z, fn)))
+rmSampTP = fn[nn]
+fn = fn[-nn]
+mapFiles = mapFiles[-nn]
+al = NULL
+for(ff in mapFiles)
+  al = c(al, list(procLogFile(ff)))
+mapEff = data.table(cbind(Timep=fn, rbindlist(al)))
+mapEff$Sample = gsub('([^.]+)\\..*','\\1',mapEff$Timep)
+setorder(mapEff, S.tot)
+mapEff
+```
+
+In this table:
+
+Column  | Description
+------- | ---------------
+Timep   | Sample-Timepoint combination, in the form SAMPLE.TPid
+S.tot   | Total number of single end reads sequenced
+S.1     | Single end reads with a single unique mapping
+S.mul   | Single end reads with multiple ambiguous mappings
+S.0     | Single end reads with no mapping
+map.pe  | Single end alignment efficiency, as $map_{pe} = \frac{S_1 + S_{mul}}{S_{tot}}$
+
+
+```{r fig.width=8, fig.height=40}
+plotBars(mapEff, cols=c('S.1','S.mul','S.0'), xscale='Reads', ytext=4) + ggtitle('Raw alignment numbers')
+```
+
+Mapping of metatranscriptomics data is towards a sample-specific metagenomic reference containing all species ever identified for all time points of this individual, coming from MetaSpades (Huttenhower).
+
+```{r}
+ddk = mapEff[,.(Total=sum(S.tot), Mapped=sum(S.1+S.mul), NoMap=sum(S.0), Effic=mean(map.se)), by=Sample]
+ddk = cbind(ddk, MapPC=ddk$Mapped / ddk$Total)
+```
+
+### Summarised by individual
+
+```{r fig.width=8, fig.height=15}
+plotBars(ddk, cols='Total', id.vars='Sample', ytext=6)
+```
+
+```{r fig.width=8, fig.height=15}
+plotBars(ddk, cols=c('Mapped','NoMap'), id.vars='Sample', ytext=6)
+```
+
+
+### Data from the feature counting (`subread featurecounts`)
+
+(Uses data from BAM file, should be essentially same as previous)
+
+This graph shows absolute number of mapped reads counted towards ORF / CDS at each timepoint for all individuals. The solid lines are the mean read counts across all.
+```{r fig.width=8, fig.height=40}
+ff = count_qcFiles[4]
+dd = countSummaryData(ff)
+dd = dd[!Timep %in% rmSampTP,]
+plotBars(dd, ytext=4) + ggtitle(basename(ff))
+```
+
+The following graph shows the relative distribution of mapped reads (the non-plotted fraction to 100% are ambiguously mapped reads).
+```{r fig.width=8, fig.height=40}
+plotBars(dd, cols=c('Assigned_pc','NoFeatures_pc','Unmapped_pc'), xscale='Fraction', ytext=4) + ggtitle(basename(ff))
+```
+
+### Summary per individual
+
+```{r}
+dd$Sample = gsub('([^.]+)\\..*','\\1',dd$Timep)
+dds = dd[,.(Assigned=sum(Assigned), NoFeat=sum(Unassigned_NoFeatures), NoMap=sum(Unassigned_Unmapped), 
+            Ambig=sum(Unassigned_Ambiguity), Total=base::sum(.SD)),
+         .SDcols=c('Assigned','Unassigned_NoFeatures','Unassigned_Unmapped','Unassigned_Ambiguity'),
+         by=Sample]
+dds = cbind(dds, dds[,.(AssignPC=Assigned/Total, NoFeatPC=NoFeat/Total, NoMapPC=NoMap/Total, AmbigPC=Ambig/Total)])
+```
+
+Total number of mapped reads:
+```{r fig.width=8, fig.height=15}
+plotBars(dds, cols='Total', id.vars='Sample', ytext=5)
+```
+
+```{r fig.width=8, fig.height=15}
+plotBars(dds,cols=colnames(dds)[2:5], id.vars='Sample', ytext=6) + ggtitle('Total per individual')
+```
+
+```{r fig.width=8, fig.height=15}
+plotBars(dds,cols=colnames(dds)[7:10], id.vars='Sample', ytext=6) + ggtitle('Fraction per individual')
+```
+
+### Sample / Timepoint exclusion for low read count
+
+Transcriptomics data does not have an acute low read count problem, though some timepoints have comparatively low counts.
+```{r fig.width=8, fig.height=12}
+ddz = mapEff[,.(min=min(S.tot), max=max(S.tot), tot=sum(S.tot), ave=mean(S.tot), num=.N), by=Sample]
+ab = as.numeric(mapEff[,.(mean(S.tot), sd(S.tot))])
+lims = c(1e6, ab[1]+2*c(-1,0,1)*ab[2])
+lims[lims<0] = 0
+gg = ggplot(data=ddz) + geom_errorbar(aes(x=Sample, ymin=min, ymax=max), size=.1) + 
+     geom_point(aes(x=Sample, y=S.tot), shape=3, stroke=.3, data=mapEff) +
+     geom_point(aes(x=Sample, y=ave, size=num, color=num), alpha=0.6) +
+     geom_hline(yintercept=lims, color=c('red4','red','blue','green4')) +
+     apatheme + ylab('Reads (log scale)') + scale_y_log10() + coord_flip()
+gg
+```
+
+Reads scale is logarithmic to enhance the difference in the minimum total number of PE reads per timepoint for some individuals.  
+The limits (coloured lines) correspond to 1MM reads (dark red), mean minus 2 standard dev (0, not whown), mean (118.5MM reads, blue) and mean plus 2 standard deviations (39MM reads, green).
+The bars extend from minimum number of reads per timepoint (of individual) to maximum.  Dot is the mean number, size and color indicate number of timepoints.
+
+The number of timepoints versus total read count is as follows (only the lower read count region shown).
+The low read count timepoints are the first rows of the table at the top of this document, but annotated here anyway.
+```{r fig.width=8, fig.height=6}
+gg = qplot(mapEff$S.tot, ecdf(mapEff$S.tot)(mapEff$S.tot)*nrow(mapEff), geom='step') +
+        geom_hline(yintercept=c(0,5,10,20,50), size=.1) + ylim(0,15) + xlim(0,2e6) +
+        apatheme + ylab('Number of timepoints') + xlab('Total reads')
+gg + geom_text(aes(x=S.tot, y=ecdf(mapEff$S.tot)(mapEff$S.tot)*nrow(mapEff), label=Timep), data=mapEff, 
+               size=3, hjust='inward', nudge_y=-.25, nudge_x=5000, color='blue3')
+```
+

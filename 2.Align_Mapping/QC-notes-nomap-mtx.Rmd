@@ -1,0 +1,382 @@
+---
+title: "Analysis of unmapped transcriptomic reads and implication in genomic composition"
+output: 
+  html_notebook:
+    code_folding: hide
+    toc: yes
+  BiocStyle::pdf_document:
+    includes: null
+    toc: no
+  html_document:
+    df_print: paged
+    toc: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE)
+options(digits=4)
+library(data.table)
+library(plyr)
+library(reshape2)
+library(data.table)
+library(ggplot2)
+apatheme = theme_bw()+
+           theme(panel.grid.major=element_blank(),
+                 panel.grid.minor=element_blank(),
+                 panel.border=element_blank(),
+                 axis.line=element_line())
+library(futile.logger)
+library(Rsamtools)
+library(seqinr)
+
+plotBars <- function(dd, cols=c('Assigned','Unassigned_NoFeatures','Unassigned_Unmapped'), xscale='Reads', 
+                     ytext=2, id.vars='Timep') {
+  bcol = c(id.vars,cols)
+  ddt = melt.data.table(dd[,..bcol], id.vars=id.vars, value.name='Value', variable.name='ReadType')
+  means = 0
+  bcol = rev(cols)
+  if(length(cols) > 1) means = colMeans(dd[,..bcol])
+  lins = cumsum(means)
+  gg = ggplot(data=ddt) + 
+       geom_bar(aes_string(x=id.vars, y="Value", fill="ReadType"),
+                stat='identity', width=1) + 
+       geom_hline(yintercept=lins) +
+       coord_flip() + ylab(xscale) +
+       apatheme + theme(axis.text.y=element_text(size=ytext))
+  return(gg)
+}
+
+```
+
+```{r setupP}
+projDir  = '/home/carlos/Projects/BIO18025-201808-FunMG-Kaiko/'
+dataDir  = paste0(projDir, 'data/20191001-align-nomap/')
+dataDir2 = paste0(projDir, 'data/20190522-QCData-rcg/mtx/')
+dataDir3 = paste0(projDir, 'rcg/analysis/mtx_mtg/2.align-mtx-nomap/')
+refsDir  = paste0(projDir, 'data/20190923-references/')
+refsDir2 = paste0(projDir, 'rcg/analysis/mtx_mtg/references/')
+genoDir  = paste0(projDir, 'rcg/genomes/')
+infoDir1 = paste0(projDir, 'data/20190723-RemovedTPs/')
+stopifnot(dir.exists(dataDir3))
+do.para = TRUE
+if(do.para) {
+  library(BiocParallel)
+  bpp = MulticoreParam(workers=10, log=T, jobname='PP1')
+  register(BPPARAM=bpp)
+}
+```
+
+## Purpose
+
+This analysis attempts to identify species that have been missed in the construction of the individual genomic references.
+
+The overall scheme of the analysis is:
+
+1. Construct a Global Genomic Reference (GGR) by putting together all species ever detected in all individuals. Recall that the definition of species in individual genomes is based on the Metaphlan analysis of Huttenhower et al.
+2. Align the unmapped transcriptomic reads in each timepoint against the GGR
+3. Filter uniquely mapping reads and extract identified genomic sequences (species)
+4. Aggregate at individual level
+5. For each individual, exclude from this list species already in the individual genomic reference
+6. Do similar analysis on unmapped Gx reads and decide if individual genomic reference should be augmented and remapped in Gx and Tx.
+
+In step 5, there should be little to no species known (we are using reads that did not map to begin with).  If there are known species --to the individual-- then, why ?
+
+By a quick look at the nomap alignment stats a few timepoints (seem grouped by individual, e.g. all timepoints of individual are similar) have a large number of reads that are **unmapped** after this process.  
+This suggests some species have not been identified yet and account for a large number of reads for the individual.
+[Compare genomic alignment to _de-novo_ sequences to see if a contig can be picked for blasting.] No idea what I meant.
+
+Mapper used is `Bowtie2`, under the assumption that splicing plays a minimal role.  The comparison to `nextgenmapper` had some differences, so maybe is worth mapping with `hisat2` which is splice-aware.  But that would mean reprocessing all the Tx data something I'm not very keen on doing.
+
+## Alignment
+
+Log files were renamed from timepoint to sample-timepoint using the following few lines.
+```{r, eval=FALSE}
+ologfiles = list.files(path=dataDir2, pattern='.*\\.log', full.names=F)
+logfiles = list.files(path=dataDir, pattern='.*.log', full.names=T)
+TPs = data.table(data.frame(logfile=logfiles, stringsAsFactors=F))
+TPs[, bf := basename(logfile)]
+TPs[, nn := sapply(bf, function(z) paste0(dataDir,ologfiles[grep(z,ologfiles)]))]
+file.rename(TPs$logfile, TPs$nn)
+```
+
+```{r}
+logfiles = list.files(path=dataDir, pattern='.*.log', full.names=T)
+TPs = data.table(data.frame(logfile=logfiles, stringsAsFactors=F))
+TPs[, tp := sapply(logfile, function(z) gsub('_align\\.log','',basename(z)))]
+TPs[, sample := gsub('([A-Z0-9]+)-.*','\\1',tp)]
+
+rmFile = paste0(infoDir1, 'remove-list.txt')
+rmSampTP = readLines(rmFile)
+rmSampTP = rmSampTP[-grep('^#',rmSampTP)]
+
+flog.info('There are %d alignment log files, and %d timepoints/samples in the remove list', nrow(TPs), length(rmSampTP))
+
+nn = unlist(sapply(rmSampTP, function(z) grep(z, make.names(TPs$tp))))
+TPs = TPs[-nn,]
+flog.info('After removing %d predefined dubious timepoints, %d timepoints remain (%d samples)', length(nn), nrow(TPs), length(unique(TPs$sample)))
+```
+
+```{r}
+procLogFile <- function(ff) {
+  ll = readLines(con=ff)
+  nr = strtoi(unlist(strsplit(ll[grep('reads; of these:$',ll)],'[ ]+'))[1])
+  su = strtoi(unlist(strsplit(ll[grep('aligned 0 times$',ll)],'[ ]+'))[2])
+  s1 = strtoi(unlist(strsplit(ll[grep('aligned exactly 1 time$',ll)],'[ ]+'))[2])
+  sm = strtoi(unlist(strsplit(ll[grep('aligned >1 times$',ll)],'[ ]+'))[2])
+  return(list(S.tot=nr, S.uniq=s1, S.mult=sm, S.nomap=su, map.se=(s1+sm)/(nr)))
+}
+TPs = cbind(TPs, rbindlist(llply(TPs$logfile, procLogFile)))
+setcolorder(TPs, colnames(TPs)[-1])
+TPs
+```
+
+This corresponds to the alignment of previously unmapped Tx reads, and columns here are:
+
+  Column   | Description
+  -------- + ----------------
+  tp       | Timepoint ID
+  sample   | Patient ID
+  S.tot    | Total originally unmapped reads (Single End)
+  S.uniq   | Number of uniquely mapping to global ref (SE)
+  S.mult   | Number of multiply mapping to global ref (SE)
+  S.nomap  | Number of unmapped to global ref (SE)
+  map.se   | Mapping efficiency $\frac{(S_{uniq}+S_{mult})}{S_{tot}}$
+  logfile  | Ditto
+
+
+### Plot of the alignment stats per timepoint
+
+```{r fig.width=8, fig.height=15}
+plotBars(TPs, cols=c('S.uniq','S.mult','S.nomap'), id.vars='tp')
+```
+
+```{r fig.width=8, fig.height=15}
+ddk = copy(TPs)
+for(cc in c('S.uniq','S.mult','S.nomap')) { set(ddk, j=paste0(cc,'_pc'), value=ddk[, ..cc] / ddk$S.tot) }
+plotBars(ddk, cols=c('S.uniq_pc','S.mult_pc','S.nomap_pc'), id.vars='tp')
+```
+
+### Summary by sample
+
+```{r fig.width=8, fig.height=10}
+ddj = ddk[, .(uniq=sum(S.uniq_pc)/.N, multi=sum(S.mult_pc)/.N, nomap=sum(S.nomap_pc)/.N), by='sample']
+setorder(ddj, nomap)
+plotBars(ddj, cols=c('uniq','multi','nomap'), id.vars='sample', ytext=6)
+```
+
+
+We now plot the ratio of uniquely mapping reads in this global reference realignment to the total number of original uniquely mapping reads against the individual genomes. This should be a proxy of the missing species read fraction in the data.
+
+```{r}
+logfiles2 = list.files(path=dataDir2, pattern='.*.log', full.names=T)
+TP2 = data.table(data.frame(logfile=logfiles2, stringsAsFactors=F))
+TP2[, tp := sapply(logfile, function(z) gsub('_align\\.log','',basename(z)))]
+TP2[, sample := gsub('([A-Z0-9]+)-.*','\\1',tp)]
+
+flog.info('%d original alignment log files, and %d timepoints/samples in the remove list', nrow(TPs), length(rmSampTP))
+
+nn = unlist(sapply(rmSampTP, function(z) grep(z, make.names(TP2$tp))))
+TP2 = TP2[-nn,]
+flog.info('After removing %d predefined dubious timepoints, %d timepoints remain (%d samples)', length(nn), nrow(TP2), length(unique(TP2$sample)))
+```
+
+In the combined table, columns are:
+
+  Column   | Description
+  -------- + ----------------
+  tp       | sample-timepoint ID
+  sample   | Patient ID
+  S.tot    | Total number of sequenced reads (original, Single End)
+  S.uniq   | Number of uniquely mapping to individual ref (SE)
+  S.mult   | Number of multiply mapping to individual ref (SE)
+  S.nomap  | Number of unmapped to individual ref (SE)
+  map.se   | Mapping efficiency $\frac{(S_{uniq}+S_{mult})}{S_{tot}}$
+  logfile  | Ditto
+  i.S.tot  | Total originally unmapped reads (Single End)
+  i.S.uniq | Number of uniquely mapping to global ref (SE)
+  i.S.mult | Number of multiply mapping to global ref (SE)
+  i.S.nomap| Number of unmapped to global ref (SE)
+  i.map.se | Mapping efficiency $\frac{(i.S_{uniq}+i.S_{mult})}{i.S_{tot}}$
+  i.logfile| for the global ref alignment
+  numfrac  | Ratio of newly uniquely mapped to original uniquely mapped $\frac{i.S_{uniq}}{S_{uniq}}$
+  nmap.se  | Combined new mapping efficiency $\frac{(S_{uniq}+S_{mult}+i.S_{uniq}+i.S_{mult})}{S_{tot}}$
+
+```{r fig.width=8, fig.height=10}
+TP2 = cbind(TP2, rbindlist(llply(TP2$logfile, procLogFile)))
+setcolorder(TP2, colnames(TP2)[-1])
+TP2 = TP2[TPs, on='tp']
+# new uniquely mapped fraction
+TP2[, numfrac := i.S.uniq / S.uniq]
+# new mapping efficiency
+TP2[, nmap.se := (S.uniq+S.mult+i.S.uniq+i.S.mult)/S.tot]
+ddk = copy(TP2[, .(tp, sample, numfrac, map.se, nmap.se)])
+plotBars(ddk, cols=c('numfrac'), id.vars='tp', xscale='Missing ratio') + ggtitle('Missing ratio per timepoint')
+```
+Values of numfrac larger than one mean that the alignment to the global ref aligns (uniquely) more reads than the uniquely aligned against the individual genome ref.
+
+
+
+Just in case we want to know which timepoint / sample the spike is:
+```{r}
+flog.info('Timepoints for which numfrac > .5', TP2[numfrac > .5,], capture=T)
+```
+
+Summarise by sample:
+```{r fig.width=8, fig.height=10}
+ddl = ddk[, .(numfrac=sum(numfrac)/.N), by='sample']
+setorder(ddl, numfrac)
+plotBars(ddl, cols=c('numfrac'), id.vars='sample', ytext=6, xscale='Mean missing ratio') + ggtitle('Mean missing ratio per sample')
+```
+In these previous two figures, the ratio is the proportion of previously unmapped reads to original uniquely mapped reads when using the individual reference.
+A value of .25 means that the newly identified reads are one fourth of previously identified (uniquely mapping).
+
+Another way of looking at the missing species is by plotting the differential mapping efficiency, this will include the overall effect of reads multiply mapping as well.
+
+
+```{r fig.width=8, fig.height=10}
+ddj = TP2[, .(uniq=sum((S.uniq+i.S.uniq)/S.tot)/.N, multi=sum((S.mult+i.S.mult)/S.tot)/.N, nomap=sum(i.S.nomap/S.tot)/.N, D.mapeff=sum(nmap.se-map.se)/.N), by='sample']
+setorder(ddj, nomap)
+plotBars(ddj, cols=c('uniq','multi','nomap'), id.vars='sample', ytext=6, xscale='Fraction') + ggtitle('New mapping distribution after remap')
+```
+
+```{r fig.width=8, fig.height=10}
+plotBars(ddj, cols=c('D.mapeff'), id.vars='sample', ytext=6, xscale='Mean fraction gain') + ggtitle('Mean delta mapping efficiency by sample')
+```
+
+
+## Detection of new species per individual
+
+Decision on whether update the individual reference is based on a threshold on newly identified reads ratio. A value of .2 means we now uniquely map at least one fifth more than originally.
+```{r}
+nmap.thr = 0.2
+ns2redo = ddl[numfrac >= nmap.thr, ]
+flog.info('Using ratio %g to detect new species: %d samples exceed the threshold', nmap.thr, nrow(ns2redo))
+ns2redo
+```
+
+For comparison, the mean delta efficiency and samples exceeding 5% gain in efficiency gain are:
+```{r}
+mapeff.thr = 0.05
+ns2mapeff = ddj[D.mapeff >= mapeff.thr, ]
+flog.info('Using a fractional gain in mapping efficiency of %g or more: %d samples exceed the threshold. Intersection: %d', 
+          mapeff.thr, nrow(ns2mapeff), length(intersect(ns2redo$sample, ns2mapeff$sample)))
+ns2mapeff
+```
+
+In order to detect which new species are there for the individual, we will extract the sequences information from the `.bam` file header and compare to the species list in the original reference definition file.
+Then we need to count the new reads on the new species and filter the very low abundance ones.
+
+We should update the individual references, rebuild and remap.  We will instead, as a first approximation, add these new reads to the previous and redo the count matrix.
+The difference would be minimal, and expected only in the fraction of multiply mapped reads.
+
+```{r, warning=FALSE, message=FALSE}
+# This part of the analysis requires the mapping of the HPC storage
+stopifnot(dir.exists(dataDir3))
+# List of bams
+bamfiles = list.files(path=dataDir3, pattern='.*.bam', full.names=T)
+flog.info('Found %d aligned BAM files', length(bamfiles))
+nn = sapply(ns2redo$sample, function(z) {p=grep(z, bamfiles); names(p)=paste(z,seq(p),sep='.'); return(p)})
+names(nn) = NULL
+nn = unlist(nn)
+flog.info('There are in total %d timepoint BAMs identified for the %d samples to process', length(nn), nrow(ns2redo))
+bamfiles = bamfiles[nn]
+
+procTimepBam <- function(file) {
+  stopifnot(length(file) == 1)
+  wh = setdiff(scanBamWhat(),  c('qual','seq','isize','mpos','mrnm'))
+  gg = scanBam(file=file, param=ScanBamParam(flag=scanBamFlag(isUnmappedQuery=F), what=wh))
+  gx = as.data.table(gg[[1]])
+  # Get primary alignments flag
+  gs = gx[bitwAnd(flag, 256) == 256, qname]  
+  gu = gx[(bitwAnd(flag, 256) == 0) & (!qname %in% gs), ]
+  flog.info('File %s: %d alignments, %d are secondary, %d uniquely mapping (%d are unique)', 
+            basename(file), nrow(gx), length(gs), nrow(gu), length(unique(gu$qname)))
+  ds = gu[, .(file=basename(file), nr=.N), by='rname']
+  setorder(ds, -nr)
+  flog.info('File %s: %d sequences with unique mappings. %d account for %g of total', 
+            basename(file), nrow(ds), sum(.9 - cumsum(ds$nr)/nrow(gu) > 0), .9)
+  return(ds)
+}
+
+if(!file.exists('seqsbam.rds')) {
+  if(do.para) {
+    seqsbam = bplapply(bamfiles, FUN=procTimepBam, BPPARAM=bpp)  
+  } else {
+    seqsbam = sapply(bamfiles, procTimepBam)
+  }
+  nm = sapply(seqsbam, function(z) {b = gsub('-sort.bam','',z[1, file]); z[, file := NULL]; return(b);} )
+  names(seqsbam) = nm
+  saveRDS(seqsbam, file='seqsbam.rds')
+  flog.info('Wrote cache file')
+} else {
+  seqsbam = readRDS('seqsbam.rds')
+  flog.info('Read cache file')
+}
+```
+
+Validity checks: All sequence levels should be same, but sequences not.  We test last using set intersection
+
+```{r}
+flog.info('"Chromosomal" sequences are the same for all timepoints: %s', 
+          all(sapply(seqsbam, function(z) all.equal(levels(z$rname), levels(seqsbam[[1]]$rname)))))
+flog.info('Lengths of sequence lists are the same: all:%s', all(sapply(seqsbam, function(z) nrow(z) == nrow(seqsbam[[1]]))))
+```
+
+Process references extracting list of chromosomal sequences
+```{r}
+nm = names(seqsbam)
+snm = gsub('([A-Z0-9]+)-.*','\\1',nm)
+allRefs = readRDS(file=paste0(refsDir, 'all-references.gff.rds'))
+
+genomes4sample <- function(asamp, genoDir='') {
+  aFile = paste0(genoDir, 'genomelist-', asamp, '.txt')
+  ll = readLines(aFile)
+  return(unique(gsub('^output = "([^.]+)\\.([0-9]+)_.*$', '\\1.\\2', ll[grep('^output =',ll)])))
+}
+
+for(kk in ns2redo$sample) {
+  nn = grep(paste0('^',kk,'-'), names(seqsbam))
+  g4s = genomes4sample(kk, genoDir=genoDir)
+  topgeno = NULL
+  for(nz in nn) {
+    zz = seqsbam[[nz]]
+    ns = sum(.8 - cumsum(zz$nr)/sum(zz$nr) > 0)
+    xx = zz[1:ns,]
+    thisgeno = unique(allRefs[xx, ncbi_genome, on=c(seqname='rname')])
+    topgeno = union(topgeno, thisgeno)
+    flog.info('Sample: %s: %d new refs, %d total', kk, length(thisgeno), length(topgeno))
+  }
+  nFile = paste0(genoDir, 'addgenolist-', kk, '.txt')
+  if(!file.exists(nFile)) {
+    writeLines(topgeno, con=nFile)
+    flog.info('Wrote new refs to %s', nFile)
+  } else {
+    flog.info('File exists: %s, skipping', nFile)
+  }
+}
+```
+
+```{r}
+```
+
+```{r}
+```
+
+```{r}
+```
+
+```{r}
+```
+
+```{r}
+```
+
+```{r}
+```
+
+```{r}
+```
+
+```{r}
+```
+
