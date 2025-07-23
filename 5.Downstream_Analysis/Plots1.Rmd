@@ -1,0 +1,1161 @@
+---
+title: "All Plots"
+date: "`r Sys.Date()`"
+author:
+- name: \bgroup HMRI Bioinformatics\newline Carlos Riveros\egroup
+  email: carlos.riveros@hmri.org.au
+output: 
+  html_notebook: 
+    toc: yes
+    toc_float: true
+    toc_collapsed: true
+    highlight: tango
+    theme: spacelab
+    code_folding: hide
+    fig_width: 8
+    fig_height: 6
+    fig_caption: yes
+---
+
+```{r include = FALSE}
+knitr::opts_chunk$set(echo=FALSE)
+
+library(data.table)
+library(openxlsx)
+library(ggplot2)
+library(DESeq2)
+library(futile.logger)
+library(magrittr)
+```
+
+# Abstract
+
+Trying to collate all plots in a single document, to ease tracking.
+
+Ref: [Draft figure overview MetaIBD paper_151121.docx](), emails MB-211130 (FW: MetaIBD zoom notes 25-11-21), MB-220307 (Graphing up final gene list), BS-220606 (Paper figure update 2-6-2022).
+
+```{r, echo=FALSE}
+projDir = '~/Projects/BIO18025-201808-FunMG-Kaiko/'
+out2Dir = paste0(projDir, 'doc/20210907-MaterialsMethodsFigs-MG/')
+outDir = paste0(projDir, 'doc/20230301-Plots-MM-FunMG/')
+metaDir  = paste0(projDir, 'data/20190501-Metadata/')
+
+min.reads = 5
+min.samp_prop = 0.3
+thres.pv = 1e-4
+thres.lfc = 2
+```
+
+# PCA Plots
+
+Principal Component analysis plots for metatranscriptomics data from the analysis for disease group samples (UC, CD, nonIBD).
+Computed from the DESeq differential expression analysis on 20200909 on expression features with 100% nucleotide similarity.
+(`20200909-DifferentialExpression`).
+
+### Activity Level
+
+```{r}
+# Using cached data from DExp analysis.
+dexpDir0 = paste0(projDir, 'doc/20200909-DifferentialExpression/')
+# For variance partition results
+dexpDir1 = paste0(projDir, 'doc/20211129-DifferentialExpression-Diagnosis/')
+dexpDir2 = paste0(projDir, 'doc/20220209-DifferentialExpression-Activity/')
+
+cacheFileVar = paste0(dexpDir0, 'mycachefile-ActivityLevel.High.Low-var1.RData')
+
+stopifnot(dir.exists(path.expand(dexpDir0)) && file.exists(cacheFileVar))
+
+{
+  bb = new.env()
+  load(file=cacheFileVar, envir=bb)
+  stopifnot(all(c('rld','vst','ntr') %in% names(bb)))
+  for(vn in c('rld','vst','ntr')) {
+    if(!is.null(get(vn, envir=bb))) {
+      assign(paste0('actHL.', vn), get(vn, envir=bb))
+    }
+  }
+  rm(bb)
+}
+```
+
+```{r, fig.height=6, fig.width=8}
+d1 = plotPCA(object=actHL.vst, intgroup='ActivityLevel', returnData=F) +
+     theme_linedraw() + 
+     labs(title='Time points PCA, Activity Level', subtitle=paste0(ncol(actHL.vst), ' time points'))
+plot(d1)
+```
+
+This PCA plot based on top 500 most variable transcriptomic features, for the `r ncol(actHL.vst)` time points with Calprotectin activity measured for UC/CD patients.
+High - Low threshold level set at 200 $\mu$g / g.
+
+
+### Disease group
+
+PCA plots using the timepoint data collapsed per sample.  Data is in `20200909-DifferentialExpression`, and we follow a workflow like in `20191115-DifferentialExpression`.
+
+Collapse by sample and filtering of data, all diagnoses.
+```{r}
+min.reads = 5
+min.samp_prop = 0.3
+
+cacheFile = paste0(out2Dir, 'mycachefile-participant-data.rds')
+if(!file.exists(cacheFile)){
+  
+  dataDir = paste0(projDir, 'data/20200909-CountsORF/')
+  countFileCache = paste0(dataDir, 'counts-ORF-100-frac.rds')
+  stopifnot(file.exists(countFileCache))
+  
+  countInfo = readRDS(file=countFileCache)
+  flog.info('Read cache file %s', countFileCache)
+  
+  flog.info('Dimension of transcription matrix %d x %d (transc x timepoints):', nrow(countInfo$counts), ncol(countInfo$counts))
+  flog.info('Number of unique transcripts passing initial filters: %d', length(countInfo$nonneglig))
+  
+  sampsFileCache = paste0(dataDir, 'funmg-samples.rds')  # Originally in 20191011-DiseaseActivity
+  stopifnot(file.exists(sampsFileCache))
+  
+  sampleInfo = readRDS(file=sampsFileCache)
+  flog.info('Read sample file cache: %s', sampsFileCache)
+  
+  flog.info('Group identification for %d timepoints', nrow(sampleInfo))
+  
+  
+  nn = match(sampleInfo[, paste0(person,'.',tp)], colnames(countInfo$counts))
+  stopifnot(all.equal(colnames(countInfo$counts)[nn], sampleInfo[, paste0(person,'.',tp)]))
+  ds = countInfo$counts[, ..nn]
+  rowD = countInfo$counts[, .(Geneid, Chr, Start, End, Strand, Length, orig_id, nuc_uid, prot_uid, cd98, cd95, name, len, prk_type, ncbi_type)]
+  
+  rm(countInfo)
+  gc(full = T)
+  
+  ds2 = data.table()
+  for(ss in unique(sampleInfo$Participant)) {
+    nn = grep(pattern=paste0('^',ss), x=colnames(ds))
+    # set(ds2, j=ss, value=ds[, rowMeans(.SD), .SDcols=nn] / length(nn))
+    set(ds2, j=ss, value=round(rowMedians(as.matrix(ds[, .SD, .SDcols=nn]), na.rm=T)))
+  }
+  
+  rm(ds)
+  gc(full = T)
+
+  ls2 = Matrix::Matrix(as.matrix(ds2) > min.reads)
+  
+  zz = rep(F, nrow(ls2))
+  for(k in unique(sampleInfo$diagnosis)) {
+    nn = which(colnames(ls2) %in% unique(sampleInfo[diagnosis == k, Participant]))
+    zz = zz | (Matrix::rowSums(ls2[, nn]) / length(nn) > min.samp_prop)
+  }
+  
+  rm(ls2)
+  gc(full = T)
+  
+  byPartSI = sampleInfo[, .(numTPs=.N, meanInterval=mean(interval_days,na.rm=T), 
+                            Age.at.diagnosis=min(Age.at.diagnosis),
+                            Diagnosis=unique(diagnosis)[1], 
+                            Occupation=unique(Occupation)[1], 
+                            Education=unique(Education)[1], 
+                            fecalcal=mean(fecalcal, na.rm=T),
+                            group=unique(group)[1],
+                            sex=unique(sex)[1]),
+                        by=Participant]
+  # Ensure same order as data
+  byPartSI = byPartSI[match(byPartSI$Participant, colnames(ds2)), ]
+  rownames(byPartSI) = colnames(ds2)
+  
+  dds <- DESeqDataSetFromMatrix(countData=ds2[zz,], colData=byPartSI, design= ~ group, rowData=rowD[zz, ])
+  rownames(dds) = rowD$Geneid[zz]
+  
+  cacheFile = paste0(outDir,  'mycachefile-participant-data.rds')
+  saveRDS(dds, file=cacheFile)
+  flog.info('Wrote DESeq cache file %s', cacheFile)
+} else {
+  dds = readRDS(cacheFile)
+  flog.info('Read DESeq cache file %s', cacheFile)
+}
+flog.info('By Sample DESeqDataSet created:')
+dds
+```
+#### At 100% protein identity
+
+```{r}
+cacheFileVar = paste0(out2Dir, 'mycachefile-participant-var1.RData')
+if(!file.exists(cacheFileVar)) {
+
+  vst = ntr = NULL
+  # We do in this order to avoid problems with geometric mean when all / most genes have at least one zero value
+  ab = estimateSizeFactorsForMatrix(counts=counts(dds)+1, locfunc=genefilter::shorth)
+  sizeFactors(dds) = ab
+  ntr = normTransform(dds)
+  flog.info('Computed normal transform variance stabilisation')
+  vst = varianceStabilizingTransformation(dds, blind=T)
+  flog.info('Computed VST variance stabilisation')
+
+  cacheFileVar = paste0(outDir, 'mycachefile-participant-var1.RData')
+  save(ntr, vst, file=cacheFileVar)
+  flog.info('Wrote cache %s', cacheFileVar)
+  dnovo100.ntr = ntr
+  dnovo100.vst = vst
+} else {
+  bb = new.env()
+  load(file=cacheFileVar, envir=bb)
+  stopifnot(all(c('vst','ntr') %in% names(bb)))
+  for(vn in c('vst','ntr')) {
+    if(!is.null(get(vn, envir=bb))) {
+      assign(paste0('dnovo100.', vn), get(vn, envir=bb))
+    }
+  }
+  rm(bb)
+}
+```
+
+The dataset contains `r nrow(dnovo100.vst)` CDS features aggregated at the 100% protein (AA) identity level.
+Non-CDS features have been excluded, and CDS represent about 13% of total transcriptomic reads.
+Timepoints are collapsed for each sample by median value on each feature, and features which have a minimum of `r min.reads` 
+for at least `r min.samp_prop*100`%  in one diagnosis group are retained.
+
+The following PCA plots are based on the 500 most variable transcriptomic features.
+
+```{r, fig.height=6, fig.width=8, message=FALSE, warning=FALSE}
+d2 = plotPCA(object=dnovo100.vst, intgroup='Diagnosis', returnData=F) +
+     theme_linedraw() + 
+     labs(title='Patient diagnosis on PCA', subtitle=paste0(ncol(dnovo100.vst), ' patients. 100% AA similarity'))
+plot(d2)
+```
+
+
+```{r, fig.height=6, fig.width=8}
+d2 = plotPCA(object=dnovo100.vst, intgroup='sex', returnData=F) +
+     theme_linedraw() + 
+     labs(title='Patient gender on PCA', subtitle=paste0(ncol(dnovo100.vst), ' patients. 100% AA similarity'))
+plot(d2)
+```
+
+```{r, fig.height=6, fig.width=8, warning=FALSE, message=FALSE}
+d2 = plotPCA(object=dnovo100.vst, intgroup='Age.at.diagnosis', returnData=F) +
+     theme_linedraw() + 
+     labs(title='Patient age on PCA', subtitle=paste0(ncol(dnovo100.vst), ' patients. 100% AA similarity')) +
+     scale_color_viridis_c(option = 'plasma')
+plot(d2)
+```
+
+#### At 98% protein identity
+
+```{r}
+cacheFileVar = paste0(out2Dir, 'mycachefile-participant-var2.RData')
+if(!file.exists(cacheFileVar)) {
+
+  ds = counts(dds)
+  rD = as.data.table(rowData(dds))
+  ds2 = NULL
+  rD2 = NULL
+  for(ss in unique(rD$cd98)) {
+    nn = rD[cd98 == ss, which = T]
+    if(length(nn) > 1) {
+      ds2 = rbind(ds2, colSums(ds[nn, ]))
+      rD2 = rbind(rD2, rD[nn[1], ])
+      rD2$n_taxa = sum(rD$n_taxa[nn])
+    } else {
+      ds2 = rbind(ds2, ds[nn, ])
+      rD2 = rbind(rD2, rD[nn, ])
+    }
+  }
+  rownames(rD2) = rD2$Geneid = rD2$cd98
+
+  dds <- DESeqDataSetFromMatrix(countData=ds2, colData=colData(dds), design= ~ group, rowData=rD2)
+  rownames(dds) = rowD$Geneid[zz]
+
+  vst = ntr = NULL
+  # We do in this order to avoid problems with geometric mean when all / most genes have at least one zero value
+  ab = estimateSizeFactorsForMatrix(counts=counts(dds)+1, locfunc=genefilter::shorth)
+  sizeFactors(dds) = ab
+  ntr = normTransform(dds)
+  flog.info('Computed normal transform variance stabilisation')
+  vst = varianceStabilizingTransformation(dds, blind=T)
+  flog.info('Computed VST variance stabilisation')
+
+  cacheFileVar = paste0(outDir, 'mycachefile-participant-var2.RData')
+  save(ntr, vst, file=cacheFileVar)
+  flog.info('Wrote cache %s', cacheFileVar)
+  dnovo98.ntr = ntr
+  dnovo98.vst = vst
+} else {
+  bb = new.env()
+  load(file=cacheFileVar, envir=bb)
+  stopifnot(all(c('vst','ntr') %in% names(bb)))
+  for(vn in c('vst','ntr')) {
+    if(!is.null(get(vn, envir=bb))) {
+      assign(paste0('dnovo98.', vn), get(vn, envir=bb))
+    }
+  }
+  rm(bb)
+}
+```
+
+The dataset contains `r nrow(dnovo98.vst)` CDS features aggregated at the 98% protein (AA) identity level.
+Timepoints are collapsed and CDS features filtered as in the 100% protein identity level dataset.
+TImepoints are collapsed for each sample by median value on each feature, and features which have a minimum of `r min.reads` 
+for at least `r min.samp_prop*100`%  in one diagnosis group are retained.
+
+The following PCA plots are based on the 500 most variable transcriptomic features.
+
+```{r, fig.height=6, fig.width=8}
+d2 = plotPCA(object=dnovo98.vst, intgroup='Diagnosis', returnData=F) +
+     theme_linedraw() + 
+     labs(title='Patient diagnosis on PCA', subtitle=paste0(ncol(dnovo98.vst), ' patients. 98% AA similarity'))
+plot(d2)
+```
+
+
+```{r, fig.height=6, fig.width=8}
+d2 = plotPCA(object=dnovo98.vst, intgroup='sex', returnData=F) +
+     theme_linedraw() + 
+     labs(title='Patient gender on PCA', subtitle=paste0(ncol(dnovo98.vst), ' patients. 98% AA similarity'))
+plot(d2)
+```
+
+```{r, fig.height=6, fig.width=8, warning=FALSE, message=FALSE}
+d2 = plotPCA(object=dnovo98.vst, intgroup='Age.at.diagnosis', returnData=F) +
+     theme_linedraw() + 
+     labs(title='Patient age on PCA', subtitle=paste0(ncol(dnovo98.vst), ' patients. 98% AA similarity')) +
+     scale_color_viridis_c(option = 'plasma')
+plot(d2)
+```
+
+# Feature annotation pie charts
+
+The following plots show the annotation from the prokariotic gene identification pipeline according to the major categories of the
+Enzyme Commission number (_EC numbers_) (see [here](https://www.brenda-enzymes.org/all_enzymes.php) or [here](https://enzyme.expasy.org/enzyme-search-ec.html))
+and the [Clusters of Orthologous Genes](https://www.ncbi.nlm.nih.gov/research/cog-project/) (_COGs_).
+For genes with multiple functional annotation in the COG database, the first (main) functional annotation is used.
+
+```{r}
+cacheFile = paste0(out2Dir, 'mycachefile-annotations.RData')
+if(!file.exists(cacheFile)) {
+  #### Get the Prokka annotation ####
+  annots = NULL
+  for(ff in c('Archaea','Bacteria','Viruses')) {
+    tsvFile = paste0(out2Dir, 'AllRef-', ff, '.tsv')
+    rr = fread(file = tsvFile)
+    annots = rbind(annots, rr[ftype=='CDS',])
+  }
+  # Add the prefix so they can be compared
+  annots[, locus_tag := paste0(locus_tag, '_gene')]
+  # Split the hierarchical Enzyme number
+  nna = annots[nchar(EC_number) > 0, which=T]
+  vtbl = lapply(annots$EC_number[nna], tstrsplit, split='.', fixed=T) 
+  vtbl = rbindlist(vtbl)
+  set(annots, i=nna, j=paste0('EC',1:4), value=vtbl)
+  
+  #### Process EC Number definitions ####
+  ecFile = paste0(out2Dir, 'enzyme-data.xml.gz')
+  aa = xml2::read_xml(ecFile)
+  # The 3rd and  tables are of interest
+  # Disassemble the file by hand
+  # Aux function
+  descramble_t <- function(aqq) {
+    qqq = lapply(aqq, function(z) {
+      cons = lapply(xml2::xml_children(z), function(y) { toString(xml2::xml_contents(y)) })
+      names(cons) = sapply(xml2::xml_children(z), function(y) { toString(xml2::xml_attrs(y)) }, USE.NAMES = F)
+      cons
+    })
+    qqq = rbindlist(qqq, fill = T)
+    names(qqq) = gsub(', true', '.T', names(qqq))
+    return(qqq)
+  }
+  # This is the table data
+  a3 = xml2::xml_children(xml2::xml_child(xml2::xml_child(aa), 6))
+  az3 = descramble_t(a3)
+  
+  a2 = xml2::xml_children(xml2::xml_child(xml2::xml_child(aa), 4))
+  az2 = descramble_t(a2)
+  
+  EC = list(prot=az3, groups=az2)
+  # Top level classes, for example:
+  # az2[subsubclass==0 & subclass==0, ]
+  
+  #### Process the COG definitions ####
+  # https://ftp.ncbi.nih.gov/pub/COG/COG2020/data/Readme.2020-11-25.txt
+  
+  cogFile = paste0(out2Dir, 'cog-20.def.tab')
+  cog = fread(cogFile, header=F, col.names=c('cogId','categories','cogName','gene','pathway','pubmedId','pdbId'))
+  
+  # Functional categories
+  cogx = fread(input = "
+            J	FCCCFC	Translation, ribosomal structure and biogenesis
+            A	FCDCFC	RNA processing and modification
+            K	FCDCEC	Transcription
+            L	FCDCDC	Replication, recombination and repair
+            B	FCDCCC	Chromatin structure and dynamics
+            D	FCFCDC	Cell cycle control, cell division, chromosome partitioning
+            Y	FCFCCC	Nuclear structure
+            V	FCFCBC	Defense mechanisms
+            T	FCFCAC	Signal transduction mechanisms
+            M	ECFCAC	Cell wall/membrane/envelope biogenesis
+            N	DCFCAC	Cell motility
+            Z	CCFCAC	Cytoskeleton
+            W	BCFCAC	Extracellular structures
+            U	ACFCAC	Intracellular trafficking, secretion, and vesicular transport
+            O	9CFCAC	Posttranslational modification, protein turnover, chaperones
+            X	9CFC9C	Mobilome: prophages, transposons
+            C	BCFCFC	Energy production and conversion
+            G	CCFCFC	Carbohydrate transport and metabolism
+            E	DCFCFC	Amino acid transport and metabolism
+            F	DCECFC	Nucleotide transport and metabolism
+            H	DCDCFC	Coenzyme transport and metabolism
+            I	DCCCFC	Lipid transport and metabolism
+            P	CCCCFC	Inorganic ion transport and metabolism
+            Q	BCCCFC	Secondary metabolites biosynthesis, transport and catabolism
+            R	E0E0E0	General function prediction only
+            S	CCCCCC	Function unknown
+  ", header=F, col.names=c('Category','color','Function'))
+  cogx[ , color := paste0('#', color)]
+  COG = list(clusters=cog, groups=cogx)
+  
+  # Save
+  cacheFile = paste0(outDir, 'mycachefile-annotations.RData')
+  save(EC, COG, annots, file=cacheFile)
+} else {
+  load(cacheFile)
+}
+# Fix colors for EC, borrow from COG
+setDT(EC$groups)
+set(EC$groups, j='color', value=list(''))
+set(EC$groups, i=EC$groups[subclass==0, which=T], j='color', value=list(sample(COG$groups$color, nrow(EC$groups[subclass==0,]))))
+```
+
+```{r}
+DT::datatable(COG$groups, caption = 'Major categories of CLusters of Orthologous Genes') %>%
+     DT::formatStyle('color', backgroundColor=DT::styleValue())
+```
+
+```{r}
+DT::datatable(EC$groups[subclass==0 & subsubclass==0, .(class, color, heading)], caption = 'Major Enzyme Groups') %>%
+     DT::formatStyle('color', backgroundColor=DT::styleValue())
+```
+
+
+## On all features identified
+
+These give context to the selected lists below. Corresponds to all `r nrow(annots)` CDS identified from metagenomes, no collapsing by sequence similarity.
+
+```{r, fig.height=6, fig.width=8}
+#### Compute our summaries ####
+# First level EC categories
+ec1l = EC$groups[subsubclass==0 & subclass==0, .(class, heading, color)]
+smry.EC = ec1l[annots[ , .N, by='EC1'], on='class==EC1']
+set(smry.EC, i=which(is.na(smry.EC$class)), j=c('heading','color'), value=list('N/A','#AAAAAA'))
+setkey(smry.EC, N)
+# plot
+# p1 = treemap::treemap(smry.EC, index = 'heading', vSize = 'N', title = 'Metagenomic features by enzyme group')
+
+pie(x=smry.EC$N, labels=smry.EC$heading, col=smry.EC$color, init.angle = 140, clockwise = F, 
+    main = 'Metagenomic features by enzyme group')
+```
+
+```{r, fig.height=6, fig.width=8}
+# First category on COG
+ann.cog1 = COG$clusters[annots, .(ID=locus_tag, Category=substr(categories,1,1), cogName, cogId), on='cogId==COG']
+smry.cog = COG$groups[ann.cog1[ , .N, by='Category'], on='Category']
+set(smry.cog, i=which(is.na(smry.cog$Category)), j=c('Category','Function','color'), value=list('', 'N/A', '#AAAAAA'))
+setkey(smry.cog, N)
+
+# Make the plots
+# p2 = treemap::treemap(smry.cog, index='Category', vSize = 'N', vColor = 'color', type='color', 
+#                       title = 'Metagenomic features by orthologous categories (COGs)')
+
+labs = smry.cog$Function
+labs[1:9] = ''
+labs[4] = 'Other functional groups'
+labs = gsub('Posttranslational', 'PT', labs)
+pie(x=smry.cog$N, labels=labs, col=smry.cog$color, init.angle = 140, clockwise = F, main = 'Metagenomic features by orthologous categories (COGs)', cex=0.75)
+```
+
+
+## On features grouped at 100% protein sequence similarity
+
+```{r, include=FALSE}
+# Function will check if any annotation selected by main ID (Geneid) has empty col1 labels that could be filled if selected by link1 column
+checkToFill <- function(anno, rD, col1, link1) {
+  # browser()
+  ny = match(rD$Geneid, anno$locus_tag)
+  nx = which(nchar(unlist(anno[ny, ..col1], use.names=F)) == 0)
+  nz = integer(0)
+  if(length(nx) > 0) {
+    nu = anno[rD[nx,], on=paste0('locus_tag==', link1), which=T]
+    nz = which(nchar(unlist(anno[nu, ..col1], use.names=F)) > 0)
+    if(length(nz) > 0) {
+      flog.warn("%d %s empty, %d of which could filled from %s", length(nx), col1, length(nz), link1)
+      return(TRUE)
+    }
+  }
+  # Lucky we have none
+  flog.info("%s: %d %s empty, 0 to fill", link1, length(nx), col1)
+  return(FALSE)
+}
+
+# Function will check if annotations with col1 labels have same label when selected by Geneid or link1
+checkConsistent <- function(anno, rD, col1, link1) {
+  # browser()
+  tocheck1 = anno[rD, on='locus_tag==Geneid']
+  nx = which(nchar(unlist(tocheck1[ , ..col1], use.names = F)) > 0)
+  tocheck1 = tocheck1[nx, .SD, .SDcols=c('locus_tag', col1)]
+  tocheck2 = anno[rD, on=paste0('locus_tag==', link1)]
+  ny = which(nchar(unlist(tocheck2[ , ..col1], use.names = F)) > 0)
+  tocheck2 = tocheck2[ny, .SD, .SDcols=c('locus_tag', 'Geneid', col1)]
+  sss = sprintf("tocheck2[tocheck1, %s != i.%s, on='Geneid==locus_tag']", col1, col1)
+  nz = which(eval(parse(text=sss)))
+  flog.info(">> %s: %d differ in %s", link1, length(nz), col1)
+  if(length(nz)) {
+    return(TRUE)
+  }
+  return(FALSE)
+}
+```
+
+```{r, include=FALSE}
+rd = as.data.table(rowData(dnovo100.vst))
+
+# For denovo100, the linking on prot_uid should be irrelevant
+checkToFill(anno = annots, rD = rd, col1 = 'EC_number', link1 = 'orig_id')
+checkToFill(anno = annots, rD = rd, col1 = 'COG',       link1 = 'orig_id')
+checkToFill(anno = annots, rD = rd, col1 = 'EC_number', link1 = 'nuc_uid')
+checkToFill(anno = annots, rD = rd, col1 = 'COG',       link1 = 'nuc_uid')
+checkToFill(anno = annots, rD = rd, col1 = 'EC_number', link1 = 'prot_uid')
+checkToFill(anno = annots, rD = rd, col1 = 'COG',       link1 = 'prot_uid')
+
+checkConsistent(anno = annots, rD = rd, col1 = 'EC_number', link1 = 'orig_id')
+checkConsistent(anno = annots, rD = rd, col1 = 'COG',       link1 = 'orig_id')
+checkConsistent(anno = annots, rD = rd, col1 = 'EC_number', link1 = 'nuc_uid')
+checkConsistent(anno = annots, rD = rd, col1 = 'COG',       link1 = 'nuc_uid')
+checkConsistent(anno = annots, rD = rd, col1 = 'EC_number', link1 = 'prot_uid')
+checkConsistent(anno = annots, rD = rd, col1 = 'COG',       link1 = 'prot_uid')
+
+myannot = annots[rd, on='locus_tag==Geneid']
+
+```
+
+The following plots depict annotation proportion on the sequences identified at 100% protein sequence similarity, that also pass the minimum read count filter for differential expression analysis.
+
+```{r, fig.height=6, fig.width=8}
+#### Compute our summaries ####
+# First level EC categories
+ec1l = EC$groups[subsubclass==0 & subclass==0, .(class, heading, color)]
+smry.EC = ec1l[myannot[ , .N, by='EC1'], on='class==EC1']
+set(smry.EC, i=which(is.na(smry.EC$class)), j=c('heading','color'), value=list('N/A','#AAAAAA'))
+setkey(smry.EC, N)
+# plot
+# p1 = treemap::treemap(smry.EC, index = 'heading', vSize = 'N', title=sprintf('Metagenomic features (100%% ss, %d seqs) by enzyme group', nrow(myannot)))
+
+pie(x=smry.EC$N, labels=smry.EC$heading, col=smry.EC$color, init.angle = 140, clockwise = F, 
+    main=sprintf('Metagenomic features (100%% ss, %d seqs) by enzyme group', nrow(myannot)))
+```
+
+
+```{r, fig.height=6, fig.width=8}
+# First category on COG
+ann.cog1 = COG$clusters[myannot, .(ID=locus_tag, Category=substr(categories,1,1), cogName, cogId), on='cogId==COG']
+smry.cog = COG$groups[ann.cog1[ , .N, by='Category'], on='Category']
+set(smry.cog, i=which(is.na(smry.cog$Category)), j=c('Category','Function','color'), value=list('', 'N/A', '#AAAAAA'))
+setkey(smry.cog, N)
+
+# Make the plots
+# p2 = treemap::treemap(smry.cog, index='Category', vSize = 'N', vColor = 'color', type='color', 
+#                       title=sprintf('Metagenomic features (100%% ss, %d seqs) by orthologous categories (COGs)', nrow(myannot)))
+
+labs = smry.cog$Function
+labs[1:9] = ''
+labs[4] = 'Other functional groups'
+labs = gsub('Posttranslational', 'PT', labs)
+pie(x=smry.cog$N, labels=labs, col=smry.cog$color, init.angle = 140, clockwise = F,
+    main=sprintf('Metagenomic features (100%% ss, %d seqs) by orthologous categories (COGs)', nrow(myannot)), cex=0.75)
+```
+
+
+## On features grouped at 98% sequence similarity
+
+```{r, include=FALSE}
+rd = as.data.table(rowData(dnovo98.vst))
+
+# For denovo98, the linking on pcd98 should be irrelevant
+checkToFill(anno = annots, rD = rd, col1 = 'EC_number', link1 = 'orig_id')
+checkToFill(anno = annots, rD = rd, col1 = 'COG',       link1 = 'orig_id')
+checkToFill(anno = annots, rD = rd, col1 = 'EC_number', link1 = 'nuc_uid')
+checkToFill(anno = annots, rD = rd, col1 = 'COG',       link1 = 'nuc_uid')
+checkToFill(anno = annots, rD = rd, col1 = 'EC_number', link1 = 'prot_uid')
+checkToFill(anno = annots, rD = rd, col1 = 'COG',       link1 = 'prot_uid')
+checkToFill(anno = annots, rD = rd, col1 = 'EC_number', link1 = 'cd98')
+checkToFill(anno = annots, rD = rd, col1 = 'COG',       link1 = 'cd98')
+
+checkConsistent(anno = annots, rD = rd, col1 = 'EC_number', link1 = 'orig_id')
+checkConsistent(anno = annots, rD = rd, col1 = 'COG',       link1 = 'orig_id')
+checkConsistent(anno = annots, rD = rd, col1 = 'EC_number', link1 = 'nuc_uid')
+checkConsistent(anno = annots, rD = rd, col1 = 'COG',       link1 = 'nuc_uid')
+checkConsistent(anno = annots, rD = rd, col1 = 'EC_number', link1 = 'prot_uid')
+checkConsistent(anno = annots, rD = rd, col1 = 'COG',       link1 = 'prot_uid')
+checkConsistent(anno = annots, rD = rd, col1 = 'EC_number', link1 = 'cd98')
+checkConsistent(anno = annots, rD = rd, col1 = 'COG',       link1 = 'cd98')
+
+myannot = annots[rd, on='locus_tag==Geneid']
+```
+
+The following plots depict the annotation proportion on the sequences identified at 98% protein sequence similarity, that also pass the minimum read count filter for differential expression analysis.
+
+```{r, fig.height=6, fig.width=8}
+#### Compute our summaries ####
+# First level EC categories
+ec1l = EC$groups[subsubclass==0 & subclass==0, .(class, heading, color)]
+smry.EC = ec1l[myannot[ , .N, by='EC1'], on='class==EC1']
+set(smry.EC, i=which(is.na(smry.EC$class)), j=c('heading','color'), value=list('N/A','#AAAAAA'))
+setkey(smry.EC, N)
+# plot
+# p1 = treemap::treemap(smry.EC, index = 'heading', vSize = 'N', title=sprintf('Metagenomic features (100%% ss, %d seqs) by enzyme group', nrow(myannot)))
+
+pie(x=smry.EC$N, labels=smry.EC$heading, col=smry.EC$color, init.angle = 140, clockwise = F, 
+    main=sprintf('Metagenomic features (98%% ss, %d seqs) by enzyme group', nrow(myannot)))
+```
+
+
+```{r, fig.height=6, fig.width=8}
+# First category on COG
+ann.cog1 = COG$clusters[myannot, .(ID=locus_tag, Category=substr(categories,1,1), cogName, cogId), on='cogId==COG']
+smry.cog = COG$groups[ann.cog1[ , .N, by='Category'], on='Category']
+set(smry.cog, i=which(is.na(smry.cog$Category)), j=c('Category','Function','color'), value=list('', 'N/A', '#AAAAAA'))
+setkey(smry.cog, N)
+
+# Make the plots
+# p2 = treemap::treemap(smry.cog, index='Category', vSize = 'N', vColor = 'color', type='color', 
+#                       title=sprintf('Metagenomic features (98%% ss, %d seqs) by orthologous categories (COGs)', nrow(myannot)))
+
+labs = smry.cog$Function
+labs[1:9] = ''
+labs[4] = 'Other functional groups'
+labs = gsub('Posttranslational', 'PT', labs)
+pie(x=smry.cog$N, labels=labs, col=smry.cog$color, init.angle = 140, clockwise = F,
+    main=sprintf('Metagenomic features (98%% ss, %d seqs) by orthologous categories (COGs)', nrow(myannot)), cex=0.75)
+```
+
+## On common top differentially expressed results from DESeq2 and Variance Partition
+
+The feature type pie charts correspond to the common features from the top 5000 results of each method, at 98% sequence similarity.  
+The Venn diagrams illustrate the overlap between results at various top results numbers.
+
+```{r, fig.height=6, fig.width=10}
+mycases = c('CD-nonIBD', 'UC-nonIBD', 'High-Low')
+mycase = 'CD-nonIBD'
+for(mycase in mycases) {
+  if(mycase == 'CD-nonIBD') {
+    resultFileDESeq = paste0(dexpDir0, 'diagnosis-', mycase, '-cd98.csv.gz')
+    resultFileVP = paste0(dexpDir1, 'diagnosis-CD-varpart-voom.cd98.csv.gz')
+  } else if(mycase == 'UC-nonIBD') {
+    resultFileDESeq = paste0(dexpDir0, 'diagnosis-', mycase, '-cd98.csv.gz')
+    resultFileVP = paste0(dexpDir1, 'diagnosis-UC-varpart-voom.cd98.csv.gz')
+  } else {
+    resultFileDESeq = paste0(dexpDir0, 'ActivityLevel-', mycase, '-cd98.csv.gz')
+    resultFileVP = paste0(dexpDir2, 'activity-High-varpart-voom.cd98.csv.gz')
+  }
+  resDS = fread(resultFileDESeq)
+  resVP = fread(resultFileVP)
+  resDS[, al2fc := -abs(log2FC)]
+  resVP[, B := -B]
+  # Set keys for intersection
+  setkey(resDS, pvalue, al2fc)
+  setkey(resVP, P.Value, B)
+  
+  glis = ilabs = NULL
+  for(nth in c(50, 500, 2000, 5000)) {
+    isec = intersect(resVP[1:nth, Geneid], resDS[1:nth, gene_id])
+    flog.info('  %s top %g:\t %d common', mycase, nth, length(isec))
+    ilis = list(resVP[1:nth, Geneid], resDS[1:nth, gene_id])
+    snames = c('DESeq','varPart')
+    gg = venn::venn(ilis, snames=snames, ggplot=T, zcolor='style', box=F) +
+      theme_void() # +
+      # labs(title=sprintf('%s: common among top %d', mycase, nth))
+    ilabs = c(ilabs, sprintf('%s: common among top %d', mycase, nth))
+    glis = c(glis, list(gg))
+  }
+  # zz = gridExtra::arrangeGrob(grobs=glis, ncol=2)
+  zz = cowplot::plot_grid(plotlist=glis, ncol=2, labels=ilabs, greedy=F,
+                         label_fontfamily='Comfortaa', label_size=11, label_fontface='plain', label_y=0.97, label_x=-.2)
+  plot(zz)
+  
+  # isec contains the intersection on 5000 top results at end of loop
+  myannot = annots[isec, on='locus_tag']
+  
+  #### Compute our summaries ####
+  smry.EC = ec1l[myannot[ , .N, by='EC1'], on='class==EC1']
+  set(smry.EC, i=which(is.na(smry.EC$class)), j=c('heading','color'), value=list('N/A','#AAAAAA'))
+  setkey(smry.EC, N)
+  # plot
+  # p1 = treemap::treemap(smry.EC, index = 'heading', vSize = 'N', 
+  #                       title=sprintf('Enzyme group on 98%% ss DE features (%d seqs), %s', nrow(myannot), mycase))
+  
+  pie(x=smry.EC$N, labels=smry.EC$heading, col=smry.EC$color, init.angle = 140, clockwise = F, 
+      main=sprintf('%s: Enzyme group for %d common seqs at 98%% ss', mycase, nrow(myannot)))
+  
+  # First category on COG
+  ann.cog1 = COG$clusters[myannot, .(ID=locus_tag, Category=substr(categories,1,1), cogName, cogId), on='cogId==COG']
+  smry.cog = COG$groups[ann.cog1[ , .N, by='Category'], on='Category']
+  set(smry.cog, i=which(is.na(smry.cog$Category)), j=c('Category','Function','color'), value=list('', 'N/A', '#AAAAAA'))
+  setkey(smry.cog, N)
+  
+  # Make the plots
+  # p2 = treemap::treemap(smry.cog, index='Category', vSize = 'N', vColor = 'color', type='color', 
+  #                       title=sprintf('Metagenomic features (98%% ss, %d seqs) by orthologous categories (COGs)', nrow(myannot)))
+  
+  labs = smry.cog$Function
+  labs[1:9] = ''
+  labs[4] = 'Other functional groups'
+  labs = gsub('Posttranslational', 'PT', labs)
+  pie(x=smry.cog$N, labels=labs, col=smry.cog$color, init.angle = 140, clockwise = F,
+      main=sprintf('%s: Orthologous categories (COGs) for %d\n common sequences at 98%% ss', mycase, nrow(myannot)), cex=0.75)
+}
+```
+
+
+
+## On Top DESeq differential expression results, 98% sequence similarity features
+
+Following plots depict enzyme and COG annotation group on DE results of 98% ss features up to adjusted S-value $\le$ 10^-4^, for each contrast.
+
+```{r, fig.height=6, fig.width=10}
+pv.thr = 1e-4
+mycases = c('CD-nonIBD', 'UC-nonIBD', 'High-Low')
+for(mycase in mycases) {
+  if(grepl('nonIBD', mycase)) {
+    resultFile = paste0(dexpDir0, 'diagnosis-', mycase, '-cd98.csv.gz')
+  } else {
+    resultFile = paste0(dexpDir0, 'ActivityLevel-', mycase, '-cd98.csv.gz')
+  }
+  
+  resData = fread(file = resultFile)
+  
+  dedata = resData[p.adjust(ape.svalue, 'fdr') < pv.thr, .(gene_id, padj, ape.svalue)]
+  # flog.info('%s: %d features with p-Value < %.5g', mycase, nrow(dedata), pv.thr)
+  myannot = annots[dedata, on='locus_tag==gene_id']
+  
+  #### Compute our summaries ####
+  # First level EC categories
+  ec1l = EC$groups[subsubclass==0 & subclass==0, .(class, heading, color)]
+  smry.EC = ec1l[myannot[ , .N, by='EC1'], on='class==EC1']
+  set(smry.EC, i=which(is.na(smry.EC$class)), j=c('heading','color'), value=list('N/A','#AAAAAA'))
+  setkey(smry.EC, N)
+  # plot
+  # p1 = treemap::treemap(smry.EC, index = 'heading', vSize = 'N', 
+  #                       title=sprintf('Enzyme group on 98%% ss DE features (%d seqs), %s', nrow(myannot), mycase))
+  
+  pie(x=smry.EC$N, labels=smry.EC$heading, col=smry.EC$color, init.angle = 140, clockwise = F, 
+      main=sprintf('Enzyme group on 98%% ss DE features (%d seqs), %s', nrow(myannot), mycase))
+  
+  # First category on COG
+  ann.cog1 = COG$clusters[myannot, .(ID=locus_tag, Category=substr(categories,1,1), cogName, cogId), on='cogId==COG']
+  smry.cog = COG$groups[ann.cog1[ , .N, by='Category'], on='Category']
+  set(smry.cog, i=which(is.na(smry.cog$Category)), j=c('Category','Function','color'), value=list('', 'N/A', '#AAAAAA'))
+  setkey(smry.cog, N)
+  
+  # Make the plots
+  # p2 = treemap::treemap(smry.cog, index='Category', vSize = 'N', vColor = 'color', type='color', 
+  #                       title=sprintf('Orthologous categories on 98%% ss DE features (%d seqs), %s', nrow(myannot), mycase))
+  
+  labs = smry.cog$Function
+  if(length(labs) > 17) {
+    labs[1:9] = ''
+    labs[4] = 'Other functional groups'
+  } else if(length(labs) > 10) {
+    labs[1:4] = ''
+    labs[2] = 'Other functional groups'
+  }
+  labs = gsub('Posttranslational', 'PT', labs)
+  pie(x=smry.cog$N, labels=labs, col=smry.cog$color, init.angle = 140, clockwise = F,
+      main=sprintf('Orthologous categories on 98%% ss DE features (%d seqs), %s', nrow(myannot), mycase), cex=0.75)
+}
+```
+
+# Protein cluster histograms
+
+```{r}
+csvannotfile = paste0(projDir, 'doc/20200706-sORF-Annotation/FullAnnotation-ORF.csv.gz')
+
+fannot = fread(file = csvannotfile)
+```
+
+## Over all identified genes
+
+### Unique genes -> Unique proteins
+
+All unique DNA sequences, expressed or not, clustered at 100% amino acid sequence similarity. Each cluster here is essentially a unique protein.
+
+```{r, warning=FALSE, fig.height=6, fig.width=10}
+# Get the unique DNA sequences
+udna = fannot[, .(cd_dna=uniq.ID.n, cd100=uniq.ID.p, cd98)]
+stopifnot(nrow(unique(udna)) == uniqueN(udna[['cd_dna']]))
+udna = unique(udna)
+duida = unique(udna[, .(clus_sz=.N), by='cd100'])
+
+gg = ggplot(data=duida, aes(x=clus_sz)) + 
+  geom_histogram(bins=max(duida[['clus_sz']]), fill='lightblue', color='darkblue', linewidth=0.1) +
+  scale_y_continuous(trans='log10') +
+  annotation_logticks(sides='l') +
+  theme_linedraw() +
+  labs(title='Number of unique clusters vs. cluster size', 
+       subtitle='All unique DNA sequences clustered at 100% AA ss.',
+       x='Cluster size' )
+gg
+```
+
+### Unique genes -> Unique portein clusters 98%
+
+All unique DNA sequences (whether expressed or not) clustered at 98% amino acid sequence similarity.
+
+```{r, warning=FALSE, fig.height=6, fig.width=10}
+duida = unique(udna[, .(clus_sz=.N), by='cd98'])
+
+gg = ggplot(data=duida, aes(x=clus_sz)) + 
+  geom_histogram(bins=max(duida[['clus_sz']]), fill='lightblue', color='darkblue', linewidth=0.1) +
+  scale_y_continuous(trans='log10') +
+  annotation_logticks(sides='l') +
+  theme_linedraw() +
+  labs(title='Number of unique clusters vs. cluster size', 
+       subtitle='All unique DNA sequences clustered at 98% AA ss.',
+       x='Cluster size' )
+gg
+
+```
+
+### Unique proteins -> Unique protein clusters 98%
+
+```{r, warning=FALSE, fig.height=6, fig.width=10}
+set(udna, j='cd_dna', value=NULL)
+stopifnot(nrow(unique(udna)) == uniqueN(udna[['cd100']]))
+udna = unique(udna)
+duida = unique(udna[, .(clus_sz=.N), by='cd98'])
+
+gg = ggplot(data=duida, aes(x=clus_sz)) + 
+  geom_histogram(bins=max(duida[['clus_sz']]), fill='#9BCD9B', color='darkblue', linewidth=0.1) +
+  scale_y_continuous(trans='log10') +
+  annotation_logticks(sides='l') +
+  theme_linedraw() +
+  labs(title='Number of unique clusters vs. cluster size', 
+       subtitle='Unique AA sequences clustered at 98% AA ss.',
+       x='Cluster size' )
+gg
+```
+
+## Over expressed genes
+
+Histograms and clusters are restricted to those cluster identifiers at 98% that pass the differential expression minimum expression criteria (number of reads in proportion of samples).
+
+### Unique genes -> Unique protein clusters 98%
+
+```{r}
+nucuids = rowData(dnovo98.vst)[['cd98']]
+udna = fannot[nucuids, .(cd_dna=uniq.ID.n, cd100=uniq.ID.p, cd98), on='cd98']
+stopifnot(uniqueN(udna[['cd98']]) == uniqueN(nucuids))
+udna = unique(udna)
+```
+
+```{r, warning=FALSE, fig.height=6, fig.width=10}
+duida = unique(udna[, .(clus_sz=.N), by='cd98'])
+
+gg = ggplot(data=duida, aes(x=clus_sz)) + 
+  geom_histogram(bins=max(duida[['clus_sz']]), fill='cadetblue2', color='dodgerblue4', linewidth=0.1) +
+  scale_y_continuous(trans='log10') +
+  annotation_logticks(sides='l') +
+  theme_linedraw() +
+  labs(title='Number of unique clusters vs. cluster size, expressed genes', 
+       subtitle='All unique DNA sequences clustered at 98% AA ss.',
+       x='Cluster size' )
+gg
+```
+
+# Taxonomic dotplot
+
+```{r, include=FALSE}
+# Load the full taxonomic table of the superkindoms in the analysis
+taxatbl = NULL
+taxdmpTarFile = paste0(metaDir, 'new_taxdump.tar.gz')
+tfl = untar(tarfile=taxdmpTarFile, list=T)
+nn = grep('rankedlineage', tfl)
+if(length(nn) == 1) {
+  untar(tarfile=taxdmpTarFile, files=tfl[nn], exdir=path.expand(outDir))
+  taxdmpFile = paste0(outDir, 'rankedlineage.dmp')
+  # We already know even columns are separators
+  taxatbl = fread(file=taxdmpFile, header=F, drop=seq(2,20,2))
+  setnames(taxatbl, new=c('tax_id','tax_name','species','genus','family','order','class','phylum','kingdom','superkingdom'))
+  file.remove(taxdmpFile)
+}
+```
+
+
+```{r, include=FALSE}
+ncbirefs = NULL
+ncbiRefFile = paste0(metaDir, 'NCBI-RefSeq-Bacteria-assembly_summary.txt.gz')
+ncbirefs = fread(ncbiRefFile, quote='')
+setnames(ncbirefs, old='# assembly_accession', new='genome')
+ncbirefs = unique(ncbirefs[, .(genome, taxid, species_taxid, organism_name)])
+
+geneannot = NULL
+gannotFile = paste0(projDir, 'data/20200921-sORF-reference/sORF-reference-100.gtf.rds')
+geneannot = readRDS(gannotFile)
+genomeannot = unique(geneannot[, ncbi_genome, by='seqname'])
+```
+
+
+```{r}
+do.ape = TRUE
+reslist = NULL
+res = NULL
+indiv = NULL
+for(contrast in c('diagnosis-CD-nonIBD','diagnosis-UC-nonIBD','ActivityLevel-High-Low')) {
+  for(aggr.fld in c('prot_uid','cd98')) {
+    sstype = ifelse(aggr.fld=='cd98', '98%', '100%')
+    # Read the differential results in
+    dexpResFile = paste0(dexpDir0, contrast, '-', aggr.fld, '.csv.gz')
+    stopifnot(file.exists(dexpResFile))
+    ares = fread(dexpResFile, drop=c('Start2','End2','Strand2','seq.nuc','seq.nuc2t','seq.aa'))
+    
+    # stopifnot(all(ares$gene_id %in% unlist(geneinfo$gene[, ..aggr.fld])))
+    flog.info('=== Results for %s (%s SS) with LFC > %d and p-value < %g:', contrast, sstype, thres.lfc, thres.pv)
+    flog.info('  Std: %d', nrow(ares[padj <= thres.pv & abs(log2FC) >= thres.lfc, ]))
+    flog.info('  APEglm: %d', nrow(ares[ape.svalue <= thres.pv & abs(ape.log2FC) >= thres.lfc, ]))
+    
+    {
+      # List of signif identifiers
+      if(do.ape) {
+        myIds = ares[ape.svalue <= thres.pv & abs(ape.log2FC) >= thres.lfc, .(gene_id, pval=ape.svalue, log2FC=ape.log2FC)]
+      } else {
+        myIds = ares[padj <= thres.pv & abs(log2FC) >= thres.lfc, .(gene_id, pval=padj, log2FC)]
+      }
+      # myIds = geneinfo$gene[myIds, on=paste0(aggr.fld, '==gene_id')]
+      myIds = fannot[, .(seqid, source, taxdomain, ID=orig.ID, prot_uid=uniq.ID.p, cd98)][myIds, on=paste0(aggr.fld, '==gene_id')]
+      myIds = myIds[, n := .N, by=aggr.fld]   # Number of unique genes per cluster
+      flog.info('  Unique scaffolds: %d', uniqueN(myIds[['seqid']]))
+      flog.info('  Unique genomes: %d', uniqueN(myIds[['source']]))
+      flog.info('  Unique CDS: %d; %d at %s SS', nrow(myIds), uniqueN(myIds[[aggr.fld]]), sstype)
+      
+      myIds = ncbirefs[myIds, on='genome==source']
+      flog.info('  Unique taxa Id: %d', uniqueN(myIds[['taxid']]))
+      flog.info('  Unique species taxa Id: %d', uniqueN(myIds[['species_taxid']]))
+      
+      # Compute total number of clusters passing detection filters for DE for taxa id in significant results
+      # Scaffolds from taxa id in result
+      cpdf = genomeannot[ncbi_genome %in% unique(myIds$genome), ]
+      # Get all genes from the scaffolds within the DE significant results (in myIds)
+      cdsftx = fannot[cpdf, .(seqid, source, ID=orig.ID, prot_uid=uniq.ID.p, cd98), on='seqid==seqname']
+      # Restrict to those in DE analysis (that is, that pass detection filters)
+      nn = which(cdsftx[[aggr.fld]] %in% ares$gene_id)
+      nn1 = nrow(cdsftx)
+      nn2 = nrow(fannot)
+      flog.info('The scaffolds picked up by DE genes comprise %d / %d (%.2f) total genes', nn1, nn2, nn1 / nn2)
+      nn1 = uniqueN(cdsftx[['prot_uid']])
+      nn2 = uniqueN(fannot[['uniq.ID.p']])
+      flog.info('This is %d / %d (%.2f) unique AA sequences', nn1, nn2, nn1 / nn2)
+      cdsftx = cdsftx[nn,]
+      flog.info('Restricting to genes that pass expression detection filters, this represents:',
+                sapply(names(cdsftx), function(n) uniqueN(cdsftx[[n]])), capture=T)
+      flog.info("Where:
+                seqid:    scaffold
+                source:   NCBI genome
+                ID:       Prokka gene
+                prot_uid: Unique AA seq (cd100)
+                cd98:     Unique cd98 cluster
+                \n")
+      # Compute summaries
+      cdsftx = cdsftx[, .(tx.norg=.N, tx.nagg=uniqueN(.SD)), .SDcols=aggr.fld, by='source']
+      # Now annotate our list
+      myIds = cdsftx[myIds, on='source==genome']
+      
+      myIds[ , m := sum(n), by='taxid']       # number of genes in result per genome (strain)
+      # ratio of clusters in DE results to clusters passing detection
+      myIds[ , prop.de := sum(n) / tx.nagg, by='taxid']
+      
+      # As we will focus on species (not strains), create summaries by species.
+      # We can use average of number of CDS or clusters for all strains of species, or we could use minimum, as we are probably overestimating
+      # myIds[ , mm := round(mean(unique(m))), by='species_taxid']
+      # myIds[ , sx.norg := min(tx.norg), by='species_taxid']
+      # myIds[ , sx.nagg := min(tx.nagg), by='species_taxid']
+      # myIds[ , sx.morg := round(mean(unique(tx.norg))), by='species_taxid']
+      # myIds[ , sx.magg := round(mean(unique(tx.nagg))), by='species_taxid']
+      
+      # Settle for the ratio of mean number of clusters in DE results over the mean number of clusters (passing detection) for genomes of the species
+      # myIds[ , prop.de := mm / sx.magg]
+
+      # Annotate species level      
+      myIds = taxatbl[myIds, on='tax_id==species_taxid']
+      # Remove some unneeded
+      set(myIds, j=c('source','species','kingdom','superkingdom'), value=list(rep(NULL,4)))
+
+      # Penalise p-values by the number of clusters of taxa passing filters (or by number of clusters in DE reesult ?). First clamp too small pvalues
+      myIds[pval < 1e-24, pval := 1e-24]
+      myIds[ , apv := sapply(pval * tx.nagg, function(z) min(1, z))]
+      
+      # Aggregated pvalue by taxa
+      suppressWarnings({
+        txs = unique(myIds[ , .(tax_id, tax_name, genus, family, phylum, organism_name, m=m[1], prop.de=prop.de[1], 
+                                min.p=metap::minimump(apv, log.p=T)$p, apv=log(min(apv))), 
+                            by='taxid'])
+      })
+      txs[is.na(min.p), min.p := apv]
+      
+      # Summarise by species
+      sps = unique(txs[ , .(tax_name, genus, family, phylum, m=round(mean(m)), prop.de=max(prop.de), 
+                            pde=mean(prop.de), min.p=mean(min.p)), 
+                        by='tax_id'])
+
+      # Some cleanup
+      # setnames(myIds, old=c('tax_id','tax_name'), new=c('Species TaxId','Species Name'))
+      
+      acont = gsub('diagnosis-', '', contrast, fixed=T)
+      acont = gsub('ActivityLevel-', 'Act. ', acont, fixed=T)
+      acont = gsub('-', ' - ', acont, fixed=T)
+      acont = sprintf('%s (%s SS)', acont, sstype)
+      txs[, cont := acont]
+      txs[, sstype := sstype]
+      sps[, cont := acont]
+      sps[, sstype := sstype]
+      myIds[, cont := acont]
+      myIds[, sstype := sstype]
+      
+      res = rbind(res, sps)
+      indiv = rbind(indiv, myIds)
+    }
+  }
+}
+```
+```{r}
+flog.info('Accross all 3 DE contrasts (CD - nonIBD, UC - nonIBD, Activity High - Low) and 2 clustering strategies (100%, 98%) we have in total:')
+flog.info('    %d taxa (%d unique), distributed as:', nrow(res), uniqueN(res[['tax_name']]))
+flog.info('', table(res[['cont']]), capture=TRUE)
+flog.info('    %d individual gene results (%d unique)', nrow(indiv), uniqueN(indiv[['ID']]))
+```
+
+```{r}
+# nn = which(mytaxa[['in_tree']])
+# mytree = rotl::tol_induced_subtree(ott_ids=rotl::ott_id(mytaxa)[nn], label_format='name')
+mtx = unique(res[, .(phylum, family, genus, tax_name, mpv=min(min.p)), by='tax_id'])
+setorderv(mtx, cols=c('phylum', 'family', 'genus', 'mpv'))
+mtxcol = list()   # Colors
+cellcolors = RColorBrewer::brewer.pal(9, 'Pastel1')
+# After sorting, leave only one cell with name in column until new name.  Sorting places empty cells first.
+for (j in c('phylum', 'family', 'genus')) {
+  ic = 0
+  if (j == 'phylum') {
+    mtxcol[[j]] = rep(cellcolors[1], nrow(mtx))  # To be overwritten
+  } else if (j == 'family') {
+    mtxcol[[j]] = mtxcol[['phylum']]
+  } else if (j == 'genus') {
+    mtxcol[[j]] = mtxcol[['family']]
+  }
+  for (k in unique(mtx[[j]])) {
+    if (k == '') next
+    ic = ic + 1
+    nn = which(mtx[[j]] == k)
+    #flog.info('Column %s, value "%s" (%d indices), color %d:%s', j, k, length(nn), ic, cellcolors[ic])
+    #flog.info('  i: %s', toString(nn))
+    mtxcol[[j]][nn] = cellcolors[ic %% 9 + 1]
+    nn = nn[-1]
+    if(length(nn) == 0) next
+    mtx[[j]][nn] = ''
+  }
+  #flog.info('', mtxcol[[j]], capture=T)
+}
+```
+
+
+```{r}
+# Attempt with combination of gridExtra and ggpubr
+mytheme = gridExtra::ttheme_minimal(base_size=9, 
+                                    core=list(bg_params=list(fill=mtxcol[['phylum']], col=NA, alpha=0.6),
+                                              fg_params=list(hjust=0, x=0.01)),
+                                    padding=unit(c(2, 2), 'pt'))
+gg = gridExtra::tableGrob(mtx[, .(phylum, family, genus, tax_name)], rows=NULL, cols=NULL, theme=mytheme)
+for (k in seq_len(nrow(mtx))) {
+  gg = gg %>% 
+       # ggpubr::table_cell_bg(row=k, column=1, fill=mtxcol[['phylum']][k], col=NA, linewidth=0) %>%
+       ggpubr::table_cell_bg(row=k, column=2, fill=mtxcol[['family']][k], col=NA, linewidth=0) %>%
+       ggpubr::table_cell_bg(row=k, column=3, fill=mtxcol[['genus']][k], col=NA, linewidth=0)
+}
+for (j in c(mtx[phylum != '', which=TRUE])) {
+  gg = gg %>% ggpubr::tab_add_hline(at.row=j, row.side='top', linecolor='blue')
+}
+gg = gg %>% ggpubr::tab_add_hline(at.row=nrow(mtx), row.side='bottom', linecolor='blue')
+
+# Make table grob "elastic:
+nlw = sum(colMaxs(as.matrix(mtx[, .(nchar(phylum), nchar(family), nchar(genus), nchar(tax_name))])))
+gg$heights = unit(rep(1/nrow(gg), nrow(gg)), 'npc')
+# gg$widths = grid::unit.pmax(gg$widths, unit(nlw, 'lines'))
+
+dd = dcast(res, tax_id + phylum + family + genus + tax_name ~ cont, value.var='min.p')
+nn = match(mtx[['tax_id']], dd[['tax_id']])  # Same order as side table
+dd = dd[nn, ]
+rn = dd$tax_name
+# Change sign and convert to log10
+dd = round(-as.matrix(dd[, 6:ncol(dd)])*log10(exp(1)), digits=2)
+# dd[dd > 40] = 40
+rownames(dd) = NULL
+
+pp = dcast(res, tax_id + phylum + family + genus + tax_name ~ cont, value.var='prop.de')
+nn = match(mtx[['tax_id']], pp[['tax_id']])  # Same order as side table
+pp = pp[nn, ]
+pp = round(as.matrix(sqrt(100 * pp[, 6:ncol(pp)])))
+# pp[which(pp > 4)] = 4
+rownames(pp) = NULL
+
+qq = as.data.frame(unique(res[, .(tax_name, genus, phylum)])[match(rn, tax_name), 2:3], stringsAsFactors=T)
+rownames(qq) = rn
+
+p1 = heatmaply::heatmaply(dd,
+                          dendrogram='none', na.rm=T,
+                          grid_color='white', grid_width=.0001, grid_size=1,
+                          fontsize_row=8,
+                          fontsize_col=8,
+                          # cellnote_size=10,
+                          na.value='grey50', 
+                          main=sprintf('Differentially expressed CDS abundance\nby Species, %s SS', sstype),
+                          label_names=c('Species','Contrast','-log10(pV)'),
+                          Rowv=FALSE,
+                          Colv=FALSE,
+                          node_type='scatter',
+                          # plot_method='plotly',
+                          plot_method='ggplot',
+                          # row_side_colors=qq,
+                          point_size_mat=pp,
+                          point_size_name='DE %\nexpressed',
+                          return_ppxpy=TRUE,
+                          # margins=c(50, 50, NA, 0),  
+                          # hide_colorbar=T,
+                          heatmap_layers=list(theme(axis.text.x=element_text(angle=-35, hjust=0, vjust=1))),
+                            # legend.title=element_text(size=8, color='darkblue'),
+                            #                          legend.text=element_text(size=8),
+                            #                          legend.box='horizontal',
+                            #                          legend.key.size=unit(.3, 'cm'),
+                            #                          legend.spacing=unit(.01,'cm'))),
+                          # side_color_layers=list(theme(legend.title=element_text(size=8),
+                          #                              legend.key.size=unit(.2,'cm'),
+                          #                              legend.spacing=unit(.05,'cm'),
+                          #                              legend.box='horizontal')),
+                          #colorbar_ypos=-2,
+                          #colorbar_xpos=1,
+                          #colorbar_xanchor='left',
+                          #colorbar_len=0.1,   # plotly
+                          #colorbar_thickness=20, # plotly
+                          # subplot_widths=c(0.6,0.1),
+                          showticklabels=c(TRUE, FALSE),
+                          labCol=colnames(dd),
+                          
+                          # labRow=rownames(dd)
+                          )
+
+gp1 = ggplotGrob(p1$p)
+panel_id = gp1$layout[gp1$layout$name == 'panel', c('t', 'l')]
+gp1 = gtable::gtable_add_cols(gp1, unit(3, 'null'), pos=0)
+gp1 = gtable::gtable_add_grob(gp1, grobs=gg, t=panel_id$t, l=1, clip='on', z=-Inf)
+
+# grid::grid.draw(gp1)
+gx = ggpubr::as_ggplot(gp1)
+```
+
+
+```{r, fig.height=15, fig.width=9.5, warning=FALSE}
+plot(gx)
+```
+
